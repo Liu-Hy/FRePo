@@ -303,7 +303,8 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     else:
         eval_normalization = normalization
 
-    if dataset_name in ['mnist', 'fashion_mnist']:
+    #if dataset_name in ['mnist', 'fashion_mnist']:
+    if 'mnist' in dataset_name.lower():
         use_flip = False
         aug_strategy = 'color_crop_rotate_scale_cutout'
     else:

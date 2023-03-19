@@ -7,6 +7,7 @@ import ml_collections
 from tqdm import tqdm
 from absl import logging
 from functools import partial
+import kornia as K
 
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
 sys.path.append("../..")
@@ -20,9 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch._vmap_internals import vmap
 
-from lib.dataset.dataloader import get_dataset
-
-from lib_torch.utils2 import get_network, evaluate_synset, get_time, TensorDataset, ParamDiffAug, \
+from lib_torch.utils2 import get_dataset, get_network, evaluate_synset, get_time, TensorDataset, ParamDiffAug, \
     save_torch_image
 
 from clu import metric_writers
@@ -223,23 +222,38 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     # --------------------------------------
     # Dataset
     # --------------------------------------
-    config.dataset.data_path = data_path if data_path else 'data/tensorflow_datasets'
-    config.dataset.zca_path = zca_path if zca_path else 'data/zca'
+    config.dataset.data_path = data_path if data_path else '/var/lib/data'
+    #config.dataset.zca_path = zca_path if zca_path else 'data/zca'
     config.dataset.name = dataset_name
 
-    (x_train, y_train, x_test, y_test), preprocess_op, rev_preprocess_op, proto_scale = get_dataset(config.dataset,
-                                                                                                    return_raw=True)
+    #(x_train, y_train, x_test, y_test), preprocess_op, rev_preprocess_op, proto_scale = get_dataset(config.dataset.name,
+                                                                                                    #config.dataset.data_path)
+    channel, im_size, num_classes, class_names, mean, std, dsts = get_dataset(config.dataset.name,
+                                                                            config.dataset.data_path)
+    x_train = dsts[0].data
+    y_train = dsts[0].targets
 
-    im_size = config.dataset.img_shape[0:2]
-    channel = config.dataset.img_shape[-1]
-    num_classes = config.dataset.num_classes
-    class_names = config.dataset.class_names
+    x_test = dsts[1].data
+    y_test = dsts[1].targets
+
+    config.dataset.img_shape = (*im_size, channel)
+    config.dataset.num_classes = num_classes
+    config.dataset.class_names = class_names
     class_map = {x: x for x in range(num_classes)}
 
-    x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2]))
-    x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2]))
-    y_train = torch.from_numpy(y_train)
-    y_test = torch.from_numpy(y_test)
+    #print(x_train.shape, len(y_train))
+    #print(y_train[0])
+    x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2])) / 255.
+    x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2])) / 255.
+
+    zca = K.enhance.ZCAWhitening(eps=0.1, compute_inv=True)
+    print(x_train.dtype)
+    zca.fit(x_train)
+    x_train = zca(x_train)
+    x_test = zca(x_test)
+
+    y_train = torch.tensor(y_train)
+    y_test = torch.tensor(y_test)
 
     dst_train = TensorDataset(x_train, y_train)
 
@@ -286,7 +300,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
 
     if save_image:
         image_saver = partial(save_torch_image, num_classes=num_classes, class_names=class_names,
-                              rev_preprocess_op=rev_preprocess_op, image_dir=image_dir, is_grey=False, save_img=True,
+                              image_dir=image_dir, is_grey=False, save_img=True,
                               save_np=False)
     else:
         image_saver = None
@@ -455,7 +469,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
         lb_loss_sum += lb_loss.item() * x_target.shape[0]
         count += x_target.shape[0]
 
-        if it % 100 == 0:
+        if it % 300 == 0:
             x_syn, y_syn = syndata.value()
             x_norm = torch.mean(torch.linalg.norm(x_syn.view(x_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
             y_norm = torch.mean(torch.linalg.norm(y_syn.view(y_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
@@ -500,8 +514,14 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
 
             ''' visualize and save '''
             x_syn, y_syn = syndata.value()
-            x_proto, y_proto = copy.deepcopy(x_syn.cpu().numpy()), copy.deepcopy(y_syn.cpu().numpy())
+            x_proto, y_proto = copy.deepcopy(x_syn.cpu()), copy.deepcopy(y_syn.cpu().numpy())
             if image_saver:
+                #print(type(x_proto))
+                x_proto = zca.inverse_transform(x_proto).numpy()
+                #for ch in range(channel):
+                    #x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
+                #x_proto[x_proto < 0] = 0.0
+                #x_proto[x_proto > 1] = 1.0
                 image_saver(x_proto, y_proto, step=it)
             last_t = time.time()
 
