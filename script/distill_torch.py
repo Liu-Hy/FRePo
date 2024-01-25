@@ -1,3 +1,12 @@
+import torch
+if torch.cuda.device_count() > 1:
+    try:
+        import haienv
+        haienv.set_env('frepo')
+        import torch
+    except:
+        pass
+
 import os
 import sys
 import fire
@@ -7,12 +16,14 @@ import ml_collections
 from tqdm import tqdm
 from absl import logging
 from functools import partial
+from lib_torch.zca_file import ZCAWhitening
+import torchattacks
+# it will report "segmentation fault (core dumped)" on the redundant import of torchvision library.
 
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
 sys.path.append("../..")
 
 import numpy as np
-import tensorflow as tf
 
 import torch
 import torch.nn as nn
@@ -20,19 +31,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch._vmap_internals import vmap
 
-from lib.dataset.dataloader import get_dataset
-
-from lib_torch.utils import get_network, evaluate_synset, get_time, TensorDataset, ParamDiffAug, \
+from lib_torch.utils2 import get_dataset, get_hfai_dataset, get_network, evaluate_synset, get_time, TensorDataset, ParamDiffAug, \
     save_torch_image
 
-from clu import metric_writers
-
+#from clu import metric_writers
 
 def get_config():
     config = ml_collections.ConfigDict()
     config.random_seed = 0
-    config.train_log = 'train_log'
-    config.train_img = 'train_img'
+    config.train_log = 'train_log_new'
+    config.train_img = 'train_img_new'
     config.resume = True
 
     config.img_size = None
@@ -46,7 +54,7 @@ def get_config():
 
     # Dataset
     config.dataset.name = 'cifar100'  # ['cifar10', 'cifar100', 'mnist', 'fashion_mnist', 'tiny_imagenet']
-    config.dataset.data_path = 'data/tensorflow_datasets'
+    config.dataset.data_path = 'data'
     config.dataset.zca_path = 'data/zca'
     config.dataset.zca_reg = 0.1
 
@@ -73,6 +81,40 @@ def get_config():
 
     return config
 
+
+def normalize_fn(tensor, mean, std):
+    """Differentiable version of torchvision.functional.normalize"""
+    # here we assume the color channel is in at dim=1
+    mean = mean[None, :, None, None]
+    std = std[None, :, None, None]
+    return tensor.sub(mean).div(std)
+
+
+class Normalize(nn.Module):
+    def __init__(self, mean=None, std=None, transform=None):
+        super(Normalize, self).__init__()
+        self.transform = None
+        if transform is not None:
+            self.transform = transform  # transform (e.g. ZCA) overrides standard normalization
+        elif mean is not None and std is not None:
+            if not isinstance(mean, torch.Tensor):
+                mean = torch.tensor(mean)
+            if not isinstance(std, torch.Tensor):
+                std = torch.tensor(std)
+            self.register_buffer("mean", mean)
+            self.register_buffer("std", std)
+        else:
+            raise Exception("Input is not complete")
+
+    def forward(self, tensor):
+        if self.transform is not None:
+            normalized = self.transform(tensor)
+        else:
+            normalized = normalize_fn(tensor, self.mean, self.std)
+        return normalized
+
+    def extra_repr(self):
+        return 'mean={}, std={}'.format(self.mean, self.std)
 
 @vmap
 def lb_margin_th(logits):
@@ -129,6 +171,7 @@ class PoolElement():
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.embedder = None
         self.initialize()
         self.step = step
 
@@ -144,10 +187,22 @@ class PoolElement():
         self.model.eval()
         if no_grad:
             with torch.no_grad():
-                return self.model.embed(x)
+                out = self.embedder(x)
+                out = out.reshape(out.size(0), -1)
+                #alt = self.model.module[1].embed(self.model.module[0](x))
+                #assert torch.norm(out - alt).item() < 0.1, f"{torch.norm(out - alt).item()}"
+                return out
+                #return self.model.module[1].embed(self.model.module[0](x))
         else:
             self.model.requires_grad_(weight_grad)
-            return self.model.embed(x)
+            #return self.model.module[1].embed(self.model.module[0](x))
+            out = self.embedder(x)
+            out = out.reshape(out.size(0), -1)
+            #alt = self.model.module[1].embed(self.model.module[0](x))
+            #assert torch.norm(out - alt).item() < 0.1, f"{torch.norm(out - alt).item()}"
+            return out
+
+
 
     def nfr(self, x_syn, y_syn, x_tar, reg=1e-6, weight_grad=False, use_flip=False):
         if use_flip:
@@ -196,6 +251,10 @@ class PoolElement():
 
     def initialize(self):
         self.model = self.get_model().to(self.device)
+        if torch.cuda.device_count() > 1:
+            self.embedder = nn.DataParallel(nn.Sequential(self.model.module[0], self.model.module[1].features))
+        else:
+            self.embedder = nn.Sequential(self.model[0], self.model[1].features)
         self.optimizer = self.get_optimizer(self.model)
         self.scheduler = self.get_scheduler(self.optimizer)
         self.step = 0
@@ -209,6 +268,7 @@ class PoolElement():
 def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=None, save_image=True,
          arch='conv', width=128, depth=3, normalization='identity', learn_label=True,
          num_prototypes_per_class=10, random_seed=0, num_train_steps=None, max_online_updates=100, num_nn_state=10):
+    print(torchattacks.__version__)
     config = get_config()
     config.random_seed = random_seed
     config.train_log = train_log if train_log else 'train_log'
@@ -223,25 +283,34 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     # --------------------------------------
     # Dataset
     # --------------------------------------
-    config.dataset.data_path = data_path if data_path else 'data/tensorflow_datasets'
+    config.dataset.data_path = data_path if data_path else 'data'
     config.dataset.zca_path = zca_path if zca_path else 'data/zca'
     config.dataset.name = dataset_name
 
-    (x_train, y_train, x_test, y_test), preprocess_op, rev_preprocess_op, proto_scale = get_dataset(config.dataset,
-                                                                                                    return_raw=True)
+    eval_it_pool = [1, 300, 1000, 3000, 10000]
+    #eval_it_pool = [300, 3000]
+    model_eval_pool = [arch]
 
-    im_size = config.dataset.img_shape[0:2]
-    channel = config.dataset.img_shape[-1]
-    num_classes = config.dataset.num_classes
-    class_names = config.dataset.class_names
+    accs_all_exps = dict()  # record performances of all experiments
+    for key in model_eval_pool:
+        accs_all_exps[key] = []
+
+    #(x_train, y_train, x_test, y_test), preprocess_op, rev_preprocess_op, proto_scale = get_dataset(config.dataset,
+
+    if torch.cuda.device_count() > 1:
+        channel, im_size, num_classes, class_names, mean, std, dsts = get_hfai_dataset(config.dataset.name,
+                                                                                  config.dataset.data_path)
+        print('Distributed training')
+    else:
+        channel, im_size, num_classes, class_names, mean, std, dsts = get_dataset(config.dataset.name,
+                                                                                  config.dataset.data_path)
+        print('Single GPU training')
+
+
+    config.dataset.img_shape = (im_size[0], im_size[1], channel)
+    config.dataset.num_classes = num_classes
+    config.dataset.class_names = class_names
     class_map = {x: x for x in range(num_classes)}
-
-    x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2]))
-    x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2]))
-    y_train = torch.from_numpy(y_train)
-    y_test = torch.from_numpy(y_test)
-
-    dst_train = TensorDataset(x_train, y_train)
 
     num_prototypes = num_prototypes_per_class * config.dataset.num_classes
     config.kernel.num_prototypes = num_prototypes
@@ -260,7 +329,33 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     # Logging
     # --------------------------------------
     steps_per_eval = 10000
-    steps_per_save = 1000
+    steps_per_save = 300
+
+    dst_train, dst_test = dsts
+
+    x_train = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
+    x_train = torch.cat(x_train, dim=0).to(config.device)
+    y_train = [dst_train[i][1] for i in range(len(dst_train))]
+    y_train = torch.tensor(y_train, dtype=torch.long, device=config.device)
+
+    print("Concatenated shapes: ", x_train.shape, y_train.shape)
+    x_test = [torch.unsqueeze(dst_test[i][0], dim=0) for i in range(len(dst_test))]
+    x_test = torch.cat(x_test, dim=0).to(config.device)
+    y_test = [dst_test[i][1] for i in range(len(dst_test))]
+    y_test = torch.tensor(y_test, dtype=torch.long, device=config.device)
+
+    x_train = x_train.float()
+    x_test = x_test.float()
+    if x_train.shape[1] > 3:
+        x_train = torch.permute(x_train, (0, 3, 1, 2))
+        x_test = torch.permute(x_test, (0, 3, 1, 2))
+    zca = ZCAWhitening(eps=0.1, compute_inv=False)
+    zca.fit(x_train)
+    normalize = Normalize(mean=mean, std=std, transform=zca)
+
+    dst_train = TensorDataset(x_train, y_train)
+
+
 
     lr_syn = config.kernel.learning_rate
     lr_net = config.online.learning_rate
@@ -274,7 +369,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     image_dir = os.path.join(config.train_img, exp_name)
     work_dir = os.path.join(config.train_log, exp_name)
     ckpt_dir = os.path.join(work_dir, 'ckpt')
-    writer = metric_writers.create_default_writer(logdir=work_dir)
+    #writer = metric_writers.create_default_writer(logdir=work_dir)
     logging.info('work_dir: {}'.format(work_dir))
 
     if not os.path.exists(ckpt_dir):
@@ -286,24 +381,17 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
 
     if save_image:
         image_saver = partial(save_torch_image, num_classes=num_classes, class_names=class_names,
-                              rev_preprocess_op=rev_preprocess_op, image_dir=image_dir, is_grey=False, save_img=True,
+                              image_dir=image_dir, is_grey=False, save_img=True,
                               save_np=False)
     else:
         image_saver = None
 
-    eval_it_pool = [1, 300, 1000, 3000, 10000]
-    model_eval_pool = [arch]
-
-    accs_all_exps = dict()  # record performances of all experiments
-    for key in model_eval_pool:
-        accs_all_exps[key] = []
 
     if normalization == 'batch':
         eval_normalization = 'identity'
     else:
         eval_normalization = normalization
 
-    #if dataset_name in ['mnist', 'fashion_mnist']:
     if 'mnist' in dataset_name.lower():
         use_flip = False
         aug_strategy = 'color_crop_rotate_scale_cutout'
@@ -344,15 +432,13 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     labels_all = []
     indices_class = [[] for c in range(num_classes)]
     print("BUILDING DATASET")
-    for i in tqdm(range(len(dst_train))):
+    for i in range(len(dst_train)):
         sample = dst_train[i]
         images_all.append(torch.unsqueeze(sample[0], dim=0))
         labels_all.append(class_map[torch.tensor(sample[1]).item()])
-
-    for i, lab in tqdm(enumerate(labels_all)):
+    for i, lab in enumerate(labels_all):
         indices_class[lab].append(i)
     images_all = torch.cat(images_all, dim=0).to("cpu")
-
     for c in range(num_classes):
         print('class c = %d: %d real images' % (c, len(indices_class[c])))
 
@@ -412,7 +498,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     count = 0
     last_t = time.time()
 
-    get_model = lambda: get_network(arch, channel, num_classes, im_size, width=width, depth=depth, norm=normalization)
+    get_model = lambda: get_network(arch, channel, num_classes, im_size, width=width, depth=depth, norm=normalization, pre_norm=normalize)
     get_optimizer = lambda m: torch.optim.Adam(m.parameters(), lr=args.lr_net, betas=(0.9, 0.999))
     get_scheduler = lambda o: torch.optim.lr_scheduler.ChainedScheduler([
         torch.optim.lr_scheduler.LinearLR(o, start_factor=0.01, total_iters=500),
@@ -466,29 +552,51 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                        'monitor/learning_rate': synsch.get_last_lr()[0],
                        'monitor/x_norm': x_norm,
                        'monitor/y_norm': y_norm}
-            writer.write_scalars(it, summary)
+            #writer.write_scalars(it, summary)
+            # print(it, summary)
+            logging.info("It {}, {}".format(it, summary))
 
             last_t = time.time()
             loss_sum, ln_loss_sum, lb_loss_sum, count = 0.0, 0.0, 0.0, 0
 
         ''' Evaluate synthetic data '''
+        if 'mnist' in config.dataset.name.lower():
+            atk_args_ls = [{"attack_eval": False},
+                           {"attack_eval": True, "method": "pgd", "eps": 0.3, "alpha": 0.1, "steps": 10},
+                           {"attack_eval": True, "method": "pgd", "eps": 0.1, "alpha": 0.03, "steps": 10},
+                           {"attack_eval": True, "method": "pgdl2", "eps": 1, "alpha": 0.3, "steps": 10},
+                           ]
+        else:
+            atk_args_ls = [{"attack_eval": False},
+                           {"attack_eval": True, "method": "pgd", "eps": 8/255, "alpha": 2/255, "steps": 10},
+                           {"attack_eval": True, "method": "pgd", "eps": 2/255, "alpha": 0.5/255, "steps": 10},
+                           {"attack_eval": True, "method": "pgdl2", "eps": 0.2, "alpha": 0.05, "steps": 10},
+                            ]
+
         if it in eval_it_pool or it % steps_per_eval == 0:
             for model_eval in model_eval_pool:
                 print(
                     '----------\nEvaluation\nmodel_train = {}, model_eval = {}, iteration = {}'.format(arch, model_eval,
                                                                                                        it))
-                accs = []
-                for it_eval in range(3):
-                    net_eval = get_network(model_eval, channel, num_classes, im_size, width=width, depth=depth,
-                                           norm=eval_normalization).to(
-                        config.device)  # get a random model
-                    x_syn, y_syn = syndata.value()
-                    x_syn_eval, y_syn_eval = copy.deepcopy(x_syn), copy.deepcopy(y_syn)
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, x_syn_eval, y_syn_eval,
-                                                             testloader, args)
-                    accs.append(acc_test)
-                summary = {'eval/acc_mean': np.mean(accs), 'eval/acc_std': np.std(accs)}
-                writer.write_scalars(it, summary)
+                for j, atk_args in enumerate(atk_args_ls):
+                    accs = []
+                    if it <= 3000:
+                        num_eval = 1
+                    else:
+                        num_eval = 10
+                    for it_eval in range(num_eval):
+                        net_eval = get_network(model_eval, channel, num_classes, im_size, width=width, depth=depth,
+                                               norm=eval_normalization, pre_norm=normalize).to(
+                            config.device)  # get a random model
+                        x_syn, y_syn = syndata.value()
+                        x_syn_eval, y_syn_eval = copy.deepcopy(x_syn), copy.deepcopy(y_syn)
+                        _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, x_syn_eval, y_syn_eval,
+                                                                 testloader, args, atk_args)
+                        accs.append(acc_test)
+                    summary = {'setting': j, 'eval/acc_mean': np.mean(accs), 'eval/acc_std': np.std(accs)}
+                    # print(it, summary)
+                    logging.info("It {}, {}".format(it, summary))
+                    # writer.write_scalars(it, summary)
 
                 if float(np.mean(accs)) > best_val_acc:
                     ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
@@ -502,6 +610,11 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
             x_syn, y_syn = syndata.value()
             x_proto, y_proto = copy.deepcopy(x_syn.cpu().numpy()), copy.deepcopy(y_syn.cpu().numpy())
             if image_saver:
+                # print(type(x_proto))
+                # x_proto = zca.inverse_transform(x_proto).cpu().numpy()
+                #for ch in range(channel):
+                    #x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
+                x_proto *= 255.
                 image_saver(x_proto, y_proto, step=it)
             last_t = time.time()
 
@@ -514,6 +627,5 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
 
 
 if __name__ == '__main__':
-    tf.config.experimental.set_visible_devices([], 'GPU')
     logging.set_verbosity('info')
     fire.Fire(main)

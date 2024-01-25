@@ -1,5 +1,8 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.autograd as autograd
+import numpy as np
 
 # Acknowledgement to
 # https://github.com/kuangliu/pytorch-cifar,
@@ -34,11 +37,124 @@ class Conv(nn.Module):
         self.features, shape_feat = self._make_layers(channel, net_width, net_depth, net_norm, net_act, net_pooling,
                                                       im_size)
         num_feat = shape_feat[0] * shape_feat[1] * shape_feat[2]
+        self.num_classes = num_classes
         self.classifier = nn.Linear(num_feat, num_classes)
 
-    def forward(self, x, return_feature=False):
-        out = self.features(x)
-        out = out.reshape(out.size(0), -1)
+    def forward(self, x, gt=None, return_feature=False, debias="none"):
+        x = self.features(x)
+
+        num_rois = x.shape[0]
+        num_channel = x.shape[1]
+        H = x.shape[2]
+        W = x.shape[3]  # H * H
+        HW = H * W
+
+        drop_f = 1. / 4
+        if debias in ["rsc"]:
+            """drop_f_pct = (1 - drop_f) * 100
+            #drop_b_pct = (1 - drop_b) * 100
+            device = "cuda" if x.is_cuda else "cpu"
+            # one-hot labels
+            # print("gt:", gt)
+            if len(gt.shape) < 2 or gt.shape[-1] == 1:
+                all_o = torch.nn.functional.one_hot(gt, self.num_classes)
+            else:
+                all_o = gt
+            # features
+            all_f = x.detach().clone().requires_grad_()
+            all_f = all_f.view(all_f.size(0), -1)
+            # predictions
+            all_p = self.classifier(all_f)
+
+            # Equation (1): compute gradients with respect to representation
+            all_g = autograd.grad((all_p * all_o).sum(), all_f)[0]
+            all_g = torch.abs(all_g)
+
+            # Equation (2): compute top-gradient-percentile mask
+            # percentiles = np.percentile(all_g.cpu(), drop_f_pct, axis=1)
+            # percentiles = torch.Tensor(percentiles)
+            # percentiles = percentiles.unsqueeze(1).repeat(1, all_g.size(1))
+            # mask_f = all_g.lt(percentiles.to(device)).float()
+
+            percentiles = np.percentile(all_g.cpu(), drop_f_pct)
+            percentiles = torch.Tensor([percentiles])
+            percentiles = percentiles.view(-1, 1)
+            mask_f = all_g.lt(percentiles.to(device)).float()
+
+            # Equation (3): mute top-gradient-percentile activations
+            all_f_muted = all_f * mask_f
+
+            # Equation (4): compute muted predictions
+            all_p_muted = self.classifier(all_f_muted)
+
+            # Section 3.3: Batch Percentage
+            all_s = F.softmax(all_p, dim=1)
+            all_s_muted = F.softmax(all_p_muted, dim=1)
+            changes = (all_s * all_o).sum(1) - (all_s_muted * all_o).sum(1)
+            percentile = np.percentile(changes.detach().cpu(), drop_b_pct)
+            mask_b = changes.lt(percentile).float().view(-1, 1)
+            # print(mask_f.shape, mask_b.shape)
+            # print(num_rois, num_channel, H, W)
+            mask = ((mask_f > 0) | (mask_b > 0)).float()
+            # mask = torch.logical_or(mask_f, mask_b).float()   # not available until pytorch 1.5
+
+            # Equations (3) and (4) again, this time mutting over examples
+            #x = x * mask.view(num_rois, num_channel, H, W)
+            mask_f = mask_f.view(num_rois, num_channel, H, W)
+            x = x * mask_f + (x * (1. - mask_f)).detach()"""
+
+            drop_f = 1 / 3.0
+            drop_b = 1 / 3.0
+            self.eval()
+            x_new = x.detach().clone().requires_grad_()
+            x_new_view = x_new.view(x_new.size(0), -1)
+            # print(x_new_view.shape)
+            output = self.classifier(x_new_view)
+            class_num = output.shape[1]
+            one_hot_sparse = gt.detach()
+            # one_hot_sparse = Variable(one_hot_sparse, requires_grad=False)
+            one_hot = torch.sum(output * one_hot_sparse)
+            self.zero_grad()
+            one_hot.backward()
+            grads_val = x_new.grad.clone().detach()
+            grad_channel_mean = torch.mean(grads_val.view(num_rois, num_channel, -1), dim=2)
+            grad_channel_mean = grad_channel_mean.view(num_rois, num_channel, 1, 1)
+            spatial_mean = torch.sum(x_new * grad_channel_mean, 1)
+            spatial_mean = spatial_mean.view(num_rois, HW)
+            self.zero_grad()
+
+            spatial_drop_num = int(HW * drop_f)
+            th_mask_value = torch.sort(spatial_mean, dim=1, descending=True)[0][:, spatial_drop_num]
+            th_mask_value = th_mask_value.view(num_rois, 1).expand(num_rois, HW)
+            mask_all_cuda = torch.where(spatial_mean > th_mask_value, torch.zeros(spatial_mean.shape).cuda(),
+                                        torch.ones(spatial_mean.shape).cuda())
+            mask_all = mask_all_cuda.reshape(num_rois, H, H).view(num_rois, 1, H, H)
+
+            cls_prob_before = F.softmax(output, dim=1)
+            x_new_view_after = x_new * mask_all
+            # x_new_view_after = self.avgpool(x_new_view_after)
+            # x_new_view_after = x_new_view_after.view(x_new_view_after.size(0), -1)
+            # x_new_view_after = self.fc(x_new_view_after)
+            x_new_view_after = x_new_view_after.view(x_new_view_after.size(0), -1)
+            x_new_view_after = self.classifier(x_new_view_after)
+            cls_prob_after = F.softmax(x_new_view_after, dim=1)
+            before_vector = torch.sum(one_hot_sparse * cls_prob_before, dim=1)
+            after_vector = torch.sum(one_hot_sparse * cls_prob_after, dim=1)
+            change_vector = before_vector - after_vector - 0.0001
+            change_vector = torch.where(change_vector > 0, change_vector, torch.zeros(change_vector.shape).cuda())
+            th_fg_value = torch.sort(change_vector, dim=0, descending=True)[0][
+                int(round(float(num_rois) * drop_b))]
+            drop_index_fg = change_vector.gt(th_fg_value).long()
+            ignore_index_fg = 1 - drop_index_fg
+            not_01_ignore_index_fg = ignore_index_fg.nonzero()[:, 0]
+            mask_all[not_01_ignore_index_fg.long(), :] = 1
+            self.train()
+            # mask_all = Variable(mask_all, requires_grad=True)
+            mask_all.requires_grad_()
+            #x = x * mask_all
+            x = x * mask_all + (x * (1. - mask_all)).detach()
+
+        out = x.reshape(x.size(0), -1)
         if return_feature:
             return out
         else:

@@ -169,13 +169,13 @@ class PoolElement():
         pred = torch.mm(kts, torch.linalg.solve(kss_reg, y_syn))
         return pred
 
-    def train_steps(self, x_syn, y_syn, steps=1):
+    def train_steps(self, x_syn, y_syn, steps=1, debias="none"):
         self.model.train()
         self.model.requires_grad_(True)
         for step in range(steps):
             x, y = self.get_batch(x_syn, y_syn)
             self.optimizer.zero_grad(set_to_none=True)
-            output = self.model(x)
+            output = self.model(x, gt=y, debias=debias)
             loss = self.loss_fn(output, y)
             loss.backward()
             self.optimizer.step()
@@ -207,7 +207,7 @@ class PoolElement():
 
 def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=None, save_image=True,
          arch='conv', width=128, depth=3, normalization='identity', learn_label=True,
-         num_prototypes_per_class=10, random_seed=0, num_train_steps=None, max_online_updates=100, num_nn_state=10):
+         num_prototypes_per_class=10, random_seed=0, num_train_steps=None, max_online_updates=100, num_nn_state=10, debias="none"):
     config = get_config()
     config.random_seed = random_seed
     config.train_log = train_log if train_log else 'train_log'
@@ -237,8 +237,34 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                                                                                                     #config.dataset.data_path)
     channel, im_size, num_classes, class_names, mean, std, dsts = get_dataset(config.dataset.name,
                                                                             config.dataset.data_path)
+    config.dataset.img_shape = (*im_size, channel)
+    config.dataset.num_classes = num_classes
+    config.dataset.class_names = class_names
+    class_map = {x: x for x in range(num_classes)}
+
+    num_prototypes = num_prototypes_per_class * config.dataset.num_classes
+    config.kernel.num_prototypes = num_prototypes
+
+    # --------------------------------------
+    # Online
+    # --------------------------------------
+    config.online.arch = arch
+    config.online.width = width
+    config.online.depth = depth
+    config.online.normalization = normalization
+    config.online.img_size = config.dataset.img_shape[0]
+    config.online.img_channels = config.dataset.img_shape[-1]
+
+    # --------------------------------------
+    # Logging
+    # --------------------------------------
+    steps_per_eval = 10000
+    steps_per_save = 1000
+
     num_folds = len(dsts) if len(dsts) > 2 else 1
+    print("debias:", debias)
     for fold in range(num_folds):
+        #if fold < 1: continue
         test_fold = fold if len(dsts) > 2 else 1
         dst_test = dsts[test_fold]
         dst_trains = [d for j, d in enumerate(dsts) if j != test_fold]
@@ -255,13 +281,6 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
         y_test = [dst_test[i][1] for i in range(len(dst_test))]
         y_test = torch.tensor(y_test, dtype=torch.long, device=config.device)
 
-        config.dataset.img_shape = (*im_size, channel)
-        config.dataset.num_classes = num_classes
-        config.dataset.class_names = class_names
-        class_map = {x: x for x in range(num_classes)}
-
-        #print(x_train.shape, len(y_train))
-        #print(y_train[0])
         #x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2])) / 255.
         #x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2])) / 255.
         #print(x_train)
@@ -271,35 +290,14 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
             x_train = torch.permute(x_train, (0, 3, 1, 2))
             x_test = torch.permute(x_test, (0, 3, 1, 2))
 
-        zca = K.enhance.ZCAWhitening(eps=0.1, compute_inv=True)
+        #zca = K.enhance.ZCAWhitening(eps=0.1, compute_inv=True)
         print(x_train.dtype)
-        zca.fit(x_train)
-        x_train = zca(x_train)
-        x_test = zca(x_test)
-
-        y_train = torch.tensor(y_train)
-        y_test = torch.tensor(y_test)
+        #zca.fit(x_train)
+        #x_train = zca(x_train)
+        #x_test = zca(x_test)
 
         dst_train = TensorDataset(x_train, y_train)
 
-        num_prototypes = num_prototypes_per_class * config.dataset.num_classes
-        config.kernel.num_prototypes = num_prototypes
-
-        # --------------------------------------
-        # Online
-        # --------------------------------------
-        config.online.arch = arch
-        config.online.width = width
-        config.online.depth = depth
-        config.online.normalization = normalization
-        config.online.img_size = config.dataset.img_shape[0]
-        config.online.img_channels = config.dataset.img_shape[-1]
-
-        # --------------------------------------
-        # Logging
-        # --------------------------------------
-        steps_per_eval = 10000
-        steps_per_save = 1000
 
         lr_syn = config.kernel.learning_rate
         lr_net = config.online.learning_rate
@@ -310,8 +308,8 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                                                             learn_label),
                                 'state{}_reset{}'.format(num_nn_state, max_online_updates))
 
-        image_dir = os.path.join(config.train_img, exp_name, str(fold))
-        work_dir = os.path.join(config.train_log, exp_name, str(fold))
+        image_dir = os.path.join(config.train_img, exp_name, str(fold)+"_control")
+        work_dir = os.path.join(config.train_log, exp_name, str(fold)+"_control")
         ckpt_dir = os.path.join(work_dir, 'ckpt')
         writer = metric_writers.create_default_writer(logdir=work_dir)
         logging.info('work_dir: {}'.format(work_dir))
@@ -336,7 +334,6 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
         else:
             eval_normalization = normalization
 
-        #if dataset_name in ['mnist', 'fashion_mnist']:
         if 'mnist' in dataset_name.lower():
             use_flip = False
             aug_strategy = 'color_crop_rotate_scale_cutout'
@@ -484,7 +481,8 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
             loss.backward()
             synopt.step()
             x_syn, y_syn = syndata.value()
-            pool_m.train_steps(x_syn, y_syn, steps=1)
+            pool_m.train_steps(x_syn, y_syn, steps=1, debias=debias)
+            #pool_m.train_steps(x_target.detach(), y_target.detach(), steps=1)
 
             synsch.step()
             loss_sum += loss.item() * x_target.shape[0]
@@ -509,6 +507,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                 loss_sum, ln_loss_sum, lb_loss_sum, count = 0.0, 0.0, 0.0, 0
 
             ''' Evaluate synthetic data '''
+            atk_args_ls = {"attack_eval": False}
             if it in eval_it_pool or it % steps_per_eval == 0:
                 for model_eval in model_eval_pool:
                     print(
@@ -522,7 +521,7 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                         x_syn, y_syn = syndata.value()
                         x_syn_eval, y_syn_eval = copy.deepcopy(x_syn), copy.deepcopy(y_syn)
                         _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, x_syn_eval, y_syn_eval,
-                                                                 testloader, args)
+                                                                 testloader, args, atk_args_ls)
                         accs.append(acc_test)
                     summary = {'eval/acc_mean': np.mean(accs), 'eval/acc_std': np.std(accs)}
                     writer.write_scalars(it, summary)
@@ -541,12 +540,11 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
                 x_proto, y_proto = copy.deepcopy(x_syn), copy.deepcopy(y_syn.cpu().numpy())
                 if image_saver:
                     #print(type(x_proto))
-                    x_proto = zca.inverse_transform(x_proto).cpu().numpy()
-                    #for ch in range(channel):
-                        #x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
-                    #x_proto = x_proto.cpu().numpy()
-                    print(x_proto.shape)
-                    print(x_proto)
+                    #x_proto = zca.inverse_transform(x_proto).cpu().numpy()
+                    for ch in range(channel):
+                        x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
+                    x_proto = x_proto.cpu().numpy()
+                    x_proto *= 255.
                     image_saver(x_proto, y_proto, step=it)
                 last_t = time.time()
 

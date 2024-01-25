@@ -8,6 +8,7 @@ from tqdm import tqdm
 from absl import logging
 from functools import partial
 import kornia as K
+from torchvision.datasets import ImageFolder
 
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
 sys.path.append("../..")
@@ -226,36 +227,22 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     #config.dataset.zca_path = zca_path if zca_path else 'data/zca'
     config.dataset.name = dataset_name
 
+    eval_it_pool = [1, 300, 1000, 3000, 10000]
+    model_eval_pool = [arch]
+
+    accs_all_exps = dict()  # record performances of all experiments
+    for key in model_eval_pool:
+        accs_all_exps[key] = []
+
     #(x_train, y_train, x_test, y_test), preprocess_op, rev_preprocess_op, proto_scale = get_dataset(config.dataset.name,
                                                                                                     #config.dataset.data_path)
     channel, im_size, num_classes, class_names, mean, std, dsts = get_dataset(config.dataset.name,
                                                                             config.dataset.data_path)
-    x_train = dsts[0].data
-    y_train = dsts[0].targets
-
-    x_test = dsts[1].data
-    y_test = dsts[1].targets
 
     config.dataset.img_shape = (*im_size, channel)
     config.dataset.num_classes = num_classes
     config.dataset.class_names = class_names
     class_map = {x: x for x in range(num_classes)}
-
-    #print(x_train.shape, len(y_train))
-    #print(y_train[0])
-    x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2])) / 255.
-    x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2])) / 255.
-
-    zca = K.enhance.ZCAWhitening(eps=0.1, compute_inv=True)
-    print(x_train.dtype)
-    zca.fit(x_train)
-    x_train = zca(x_train)
-    x_test = zca(x_test)
-
-    y_train = torch.tensor(y_train)
-    y_test = torch.tensor(y_test)
-
-    dst_train = TensorDataset(x_train, y_train)
 
     num_prototypes = num_prototypes_per_class * config.dataset.num_classes
     config.kernel.num_prototypes = num_prototypes
@@ -270,267 +257,301 @@ def main(dataset_name, data_path=None, zca_path=None, train_log=None, train_img=
     config.online.img_size = config.dataset.img_shape[0]
     config.online.img_channels = config.dataset.img_shape[-1]
 
-    # --------------------------------------
-    # Logging
-    # --------------------------------------
-    steps_per_eval = 10000
-    steps_per_save = 1000
+    num_folds = len(dsts) if len(dsts) > 2 else 1
+    for fold in range(num_folds):
+        test_fold = fold if len(dsts) > 2 else 1
+        dst_test = dsts[test_fold]
+        dst_trains = [d for j, d in enumerate(dsts) if j != test_fold]
+        x_train = [torch.unsqueeze(dst_train[i][0], dim=0) for dst_train in dst_trains for i in
+                   range(len(dst_train))]
+        x_train = torch.cat(x_train, dim=0).to(config.device)
+        y_train = [dst_train[i][1] for dst_train in dst_trains for i in range(len(dst_train))]
+        y_train = torch.tensor(y_train, dtype=torch.long, device=config.device)
+        print("Concatenated shapes: ", x_train.shape, y_train.shape)
 
-    lr_syn = config.kernel.learning_rate
-    lr_net = config.online.learning_rate
-    exp_name = os.path.join('{}'.format(dataset_name),
-                            'step{}K_num{}'.format(num_train_steps // 1000, num_prototypes),
-                            '{}_w{}_d{}_{}_ll{}'.format(config.online.arch, config.online.width,
-                                                        config.online.depth, config.online.normalization,
-                                                        learn_label),
-                            'state{}_reset{}'.format(num_nn_state, max_online_updates))
+        x_test = [torch.unsqueeze(dst_test[i][0], dim=0) for i in range(len(dst_test))]
+        x_test = torch.cat(x_test, dim=0).to(config.device)
+        y_test = [dst_test[i][1] for i in range(len(dst_test))]
+        y_test = torch.tensor(y_test, dtype=torch.long, device=config.device)
 
-    image_dir = os.path.join(config.train_img, exp_name)
-    work_dir = os.path.join(config.train_log, exp_name)
-    ckpt_dir = os.path.join(work_dir, 'ckpt')
-    writer = metric_writers.create_default_writer(logdir=work_dir)
-    logging.info('work_dir: {}'.format(work_dir))
+        #x_train = dsts[0].data
+        #y_train = dsts[0].targets
 
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    if not os.path.exists(image_dir):
-        os.makedirs(image_dir)
+        #x_test = dsts[1].data
+        #y_test = dsts[1].targets
 
-    logging.info("image_dir: {}!".format(image_dir))
+        #print(x_train.shape, len(y_train))
+        #print(y_train[0])
+        print(x_train)
+        x_train = torch.from_numpy(np.transpose(x_train, axes=[0, 3, 1, 2])) / 255.
+        x_test = torch.from_numpy(np.transpose(x_test, axes=[0, 3, 1, 2])) / 255.
 
-    if save_image:
-        image_saver = partial(save_torch_image, num_classes=num_classes, class_names=class_names,
-                              image_dir=image_dir, is_grey=False, save_img=True,
-                              save_np=False)
-    else:
-        image_saver = None
+        zca = K.enhance.ZCAWhitening(eps=0.1, compute_inv=True)
+        print(x_train.dtype)
+        zca.fit(x_train)
+        x_train = zca(x_train)
+        x_test = zca(x_test)
 
-    eval_it_pool = [1, 300, 1000, 3000, 10000]
-    model_eval_pool = [arch]
+        y_train = torch.tensor(y_train)
+        y_test = torch.tensor(y_test)
 
-    accs_all_exps = dict()  # record performances of all experiments
-    for key in model_eval_pool:
-        accs_all_exps[key] = []
+        dst_train = TensorDataset(x_train, y_train)
 
-    if normalization == 'batch':
-        eval_normalization = 'identity'
-    else:
-        eval_normalization = normalization
+        # --------------------------------------
+        # Logging
+        # --------------------------------------
+        steps_per_eval = 10000
+        steps_per_save = 1000
 
-    #if dataset_name in ['mnist', 'fashion_mnist']:
-    if 'mnist' in dataset_name.lower():
-        use_flip = False
-        aug_strategy = 'color_crop_rotate_scale_cutout'
-    else:
-        use_flip = True
-        aug_strategy = 'flip_color_crop_rotate_scale_cutout'
+        lr_syn = config.kernel.learning_rate
+        lr_net = config.online.learning_rate
+        exp_name = os.path.join('{}'.format(dataset_name),
+                                'step{}K_num{}'.format(num_train_steps // 1000, num_prototypes),
+                                '{}_w{}_d{}_{}_ll{}'.format(config.online.arch, config.online.width,
+                                                            config.online.depth, config.online.normalization,
+                                                            learn_label),
+                                'state{}_reset{}'.format(num_nn_state, max_online_updates))
 
-    if dataset_name == 'tiny_imagenet':
-        if num_prototypes_per_class == 1:
-            use_flip = True
-        elif num_prototypes_per_class == 10:
-            use_flip = False
+        image_dir = os.path.join(config.train_img, exp_name, str(fold))
+        work_dir = os.path.join(config.train_log, exp_name, str(fold))
+        ckpt_dir = os.path.join(work_dir, 'ckpt')
+        writer = metric_writers.create_default_writer(logdir=work_dir)
+        logging.info('work_dir: {}'.format(work_dir))
+
+        if not os.path.exists(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        if not os.path.exists(image_dir):
+            os.makedirs(image_dir)
+
+        logging.info("image_dir: {}!".format(image_dir))
+
+        if save_image:
+            image_saver = partial(save_torch_image, num_classes=num_classes, class_names=class_names,
+                                  image_dir=image_dir, is_grey=False, save_img=True,
+                                  save_np=False)
         else:
-            raise ValueError(
-                'Unsupported prototypes per class {} for {}'.format(num_prototypes_per_class, dataset_name))
+            image_saver = None
 
-    if dataset_name == 'imagenet_resized/64x64':
-        use_flip = False
+        if normalization == 'batch':
+            eval_normalization = 'identity'
+        else:
+            eval_normalization = normalization
 
-    step_per_prototpyes = {10: 1000, 100: 2000, 200: 20000, 400: 5000, 500: 5000, 1000: 10000, 2000: 40000, 5000: 40000}
-    num_online_eval_updates = step_per_prototpyes[num_prototypes]
+        #if dataset_name in ['mnist', 'fashion_mnist']:
+        if 'mnist' in dataset_name.lower():
+            use_flip = False
+            aug_strategy = 'color_crop_rotate_scale_cutout'
+        else:
+            use_flip = True
+            aug_strategy = 'flip_color_crop_rotate_scale_cutout'
 
-    args = ml_collections.ConfigDict()
-    args.model = arch
-    args.device = config.device
-    args.lr_net = lr_net
-    args.epoch_eval_train = num_online_eval_updates
-    args.batch_train = min(num_prototypes, 500)
-    args.dsa = True
-    args.dsa_strategy = aug_strategy
-    args.dsa_param = ParamDiffAug()  # Todo: Implementation is slightly different from JAX Version.
+        if dataset_name == 'tiny_imagenet':
+            if num_prototypes_per_class == 1:
+                use_flip = True
+            elif num_prototypes_per_class == 10:
+                use_flip = False
+            else:
+                raise ValueError(
+                    'Unsupported prototypes per class {} for {}'.format(num_prototypes_per_class, dataset_name))
 
-    criterion = nn.MSELoss(reduction='none').to(config.device)
-    # --------------------------------------
-    # Organize the real dataset
-    # --------------------------------------
-    images_all = []
-    labels_all = []
-    indices_class = [[] for c in range(num_classes)]
-    print("BUILDING DATASET")
-    for i in tqdm(range(len(dst_train))):
-        sample = dst_train[i]
-        images_all.append(torch.unsqueeze(sample[0], dim=0))
-        labels_all.append(class_map[torch.tensor(sample[1]).item()])
+        if dataset_name == 'imagenet_resized/64x64':
+            use_flip = False
 
-    for i, lab in tqdm(enumerate(labels_all)):
-        indices_class[lab].append(i)
-    images_all = torch.cat(images_all, dim=0).to("cpu")
+        step_per_prototpyes = {10: 1000, 100: 2000, 200: 20000, 400: 5000, 500: 5000, 1000: 10000, 2000: 40000, 5000: 40000}
+        num_online_eval_updates = step_per_prototpyes[num_prototypes]
 
-    for c in range(num_classes):
-        print('class c = %d: %d real images' % (c, len(indices_class[c])))
+        args = ml_collections.ConfigDict()
+        args.model = arch
+        args.device = config.device
+        args.lr_net = lr_net
+        args.epoch_eval_train = num_online_eval_updates
+        args.batch_train = min(num_prototypes, 500)
+        args.dsa = True
+        args.dsa_strategy = aug_strategy
+        args.dsa_param = ParamDiffAug()  # Todo: Implementation is slightly different from JAX Version.
 
-    def get_images(c, n):  # get random n images from class c
-        idx_shuffle = np.random.permutation(indices_class[c])[:n]
-        return images_all[idx_shuffle]
+        criterion = nn.MSELoss(reduction='none').to(config.device)
+        # --------------------------------------
+        # Organize the real dataset
+        # --------------------------------------
+        images_all = []
+        labels_all = []
+        indices_class = [[] for c in range(num_classes)]
+        print("BUILDING DATASET")
+        for i in tqdm(range(len(dst_train))):
+            sample = dst_train[i]
+            images_all.append(torch.unsqueeze(sample[0], dim=0))
+            labels_all.append(class_map[torch.tensor(sample[1]).item()])
 
-    # --------------------------------------
-    # Initialize the synthetic data
-    # --------------------------------------
-    y_syn = torch.tensor(np.array([np.ones(num_prototypes_per_class) * i for i in range(num_classes)]),
-                         dtype=torch.long,
-                         device=config.device).view(-1)  # [0,0,0, 1,1,1, ..., 9,9,9]
-    x_syn = torch.randn(size=(num_classes * num_prototypes_per_class, channel, im_size[0], im_size[1]),
-                        dtype=torch.float)
+        for i, lab in tqdm(enumerate(labels_all)):
+            indices_class[lab].append(i)
+        images_all = torch.cat(images_all, dim=0).to("cpu")
 
-    for c in range(num_classes):
-        x_syn.data[c * num_prototypes_per_class:(c + 1) * num_prototypes_per_class] = get_images(c,
-                                                                                                 num_prototypes_per_class).detach().data
+        for c in range(num_classes):
+            print('class c = %d: %d real images' % (c, len(indices_class[c])))
 
-    y_scale = np.sqrt(num_classes / 10)
-    y_train = F.one_hot(y_train, num_classes=num_classes) - 1 / num_classes
-    y_test = F.one_hot(y_test, num_classes=num_classes) - 1 / num_classes
+        def get_images(c, n):  # get random n images from class c
+            idx_shuffle = np.random.permutation(indices_class[c])[:n]
+            return images_all[idx_shuffle]
 
-    dst_train = TensorDataset(x_train, y_train)
-    dst_test = TensorDataset(x_test, y_test)
-    trainloader = InfiniteDataLoader(dst_train, batch_size=1024, shuffle=True, num_workers=0)
-    testloader = DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=0)
+        # --------------------------------------
+        # Initialize the synthetic data
+        # --------------------------------------
+        y_syn = torch.tensor(np.array([np.ones(num_prototypes_per_class) * i for i in range(num_classes)]),
+                             dtype=torch.long,
+                             device=config.device).view(-1)  # [0,0,0, 1,1,1, ..., 9,9,9]
+        x_syn = torch.randn(size=(num_classes * num_prototypes_per_class, channel, im_size[0], im_size[1]),
+                            dtype=torch.float)
 
-    y_syn = (F.one_hot(y_syn, num_classes=num_classes) - 1 / num_classes) / y_scale
+        for c in range(num_classes):
+            x_syn.data[c * num_prototypes_per_class:(c + 1) * num_prototypes_per_class] = get_images(c,
+                                                                                                     num_prototypes_per_class).detach().data
 
-    syndata = SynData(x_syn, y_syn, learn_label=learn_label).to(config.device)
-    # Todo: Different from the paper and JAX Version which use LAMB optimizer, Adam is used here.
-    synopt = torch.optim.Adam(syndata.parameters(), lr=lr_syn)
-    synsch = torch.optim.lr_scheduler.CosineAnnealingLR(synopt, T_max=num_train_steps, eta_min=lr_syn * 0.1)
+        y_scale = np.sqrt(num_classes / 10)
+        y_train = F.one_hot(y_train, num_classes=num_classes) - 1 / num_classes
+        y_test = F.one_hot(y_test, num_classes=num_classes) - 1 / num_classes
 
-    step_offset = 0
-    best_val_acc = 0.0
+        dst_train = TensorDataset(x_train, y_train)
+        dst_test = TensorDataset(x_test, y_test)
+        trainloader = InfiniteDataLoader(dst_train, batch_size=1024, shuffle=True, num_workers=0)
+        testloader = DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=0)
 
-    if config.resume:
-        ckpt_path = os.path.join(ckpt_dir, 'ckpt.pt')
-        try:
-            checkpoint = torch.load(ckpt_path)
-            syndata.load_state_dict(checkpoint['syndata_state_dict'])
-            synopt.load_state_dict(checkpoint['synopt_state_dict'])
-            synsch.load_state_dict(checkpoint['synsch_state_dict'])
-            step_offset = checkpoint['step_offset']
-            best_val_acc = checkpoint['best_val_acc']
-            logging.info('Load checkpoint from {}!'.format(ckpt_path))
-            logging.info('step_offset: {}, best_val_acc: {}'.format(step_offset, best_val_acc))
-        except:
-            logging.info('No checkpoints found in {}!'.format(ckpt_dir))
+        y_syn = (F.one_hot(y_syn, num_classes=num_classes) - 1 / num_classes) / y_scale
 
-    loss_sum = 0.0
-    ln_loss_sum = 0.0
-    lb_loss_sum = 0.0
-    count = 0
-    last_t = time.time()
+        syndata = SynData(x_syn, y_syn, learn_label=learn_label).to(config.device)
+        # Todo: Different from the paper and JAX Version which use LAMB optimizer, Adam is used here.
+        synopt = torch.optim.Adam(syndata.parameters(), lr=lr_syn)
+        synsch = torch.optim.lr_scheduler.CosineAnnealingLR(synopt, T_max=num_train_steps, eta_min=lr_syn * 0.1)
 
-    get_model = lambda: get_network(arch, channel, num_classes, im_size, width=width, depth=depth, norm=normalization)
-    get_optimizer = lambda m: torch.optim.Adam(m.parameters(), lr=args.lr_net, betas=(0.9, 0.999))
-    get_scheduler = lambda o: torch.optim.lr_scheduler.ChainedScheduler([
-        torch.optim.lr_scheduler.LinearLR(o, start_factor=0.01, total_iters=500),
-        torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=max_online_updates, eta_min=args.lr_net * 0.01)])
+        step_offset = 0
+        best_val_acc = 0.0
 
-    pools = []
-    for idx in range(num_nn_state):
-        init_step = (max_online_updates // num_nn_state) * idx
-        pools.append(PoolElement(get_model=get_model, get_optimizer=get_optimizer, get_scheduler=get_scheduler,
-                                 loss_fn=nn.MSELoss(), batch_size=500, max_online_updates=max_online_updates, idx=idx,
-                                 device=config.device, step=init_step))
+        if config.resume:
+            ckpt_path = os.path.join(ckpt_dir, 'ckpt.pt')
+            try:
+                checkpoint = torch.load(ckpt_path)
+                syndata.load_state_dict(checkpoint['syndata_state_dict'])
+                synopt.load_state_dict(checkpoint['synopt_state_dict'])
+                synsch.load_state_dict(checkpoint['synsch_state_dict'])
+                step_offset = checkpoint['step_offset']
+                best_val_acc = checkpoint['best_val_acc']
+                logging.info('Load checkpoint from {}!'.format(ckpt_path))
+                logging.info('step_offset: {}, best_val_acc: {}'.format(step_offset, best_val_acc))
+            except:
+                logging.info('No checkpoints found in {}!'.format(ckpt_dir))
 
-    # --------------------------------------
-    # Train
-    # --------------------------------------
-    for it in range(step_offset + 1, num_train_steps + 1):
-        ''' Train synthetic data '''
-        x_target, y_target = next(trainloader)
-        x_target = x_target.to(config.device)
-        y_target = y_target.to(config.device)
-        x_syn, y_syn = syndata()
+        loss_sum = 0.0
+        ln_loss_sum = 0.0
+        lb_loss_sum = 0.0
+        count = 0
+        last_t = time.time()
 
-        idx = np.random.randint(low=0, high=num_nn_state)
-        pool_m = pools[idx]
+        get_model = lambda: get_network(arch, channel, num_classes, im_size, width=width, depth=depth, norm=normalization)
+        get_optimizer = lambda m: torch.optim.Adam(m.parameters(), lr=args.lr_net, betas=(0.9, 0.999))
+        get_scheduler = lambda o: torch.optim.lr_scheduler.ChainedScheduler([
+            torch.optim.lr_scheduler.LinearLR(o, start_factor=0.01, total_iters=500),
+            torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=max_online_updates, eta_min=args.lr_net * 0.01)])
 
-        y_pred = pool_m.nfr(x_syn, y_syn, x_target, use_flip=use_flip)
-        ln_loss = criterion(y_pred, y_target).sum(dim=-1).mean(0)
-        lb_loss = lb_margin_th(y_syn).mean()
-        loss = ln_loss + lb_loss
+        pools = []
+        for idx in range(num_nn_state):
+            init_step = (max_online_updates // num_nn_state) * idx
+            pools.append(PoolElement(get_model=get_model, get_optimizer=get_optimizer, get_scheduler=get_scheduler,
+                                     loss_fn=nn.MSELoss(), batch_size=500, max_online_updates=max_online_updates, idx=idx,
+                                     device=config.device, step=init_step))
 
-        synopt.zero_grad(set_to_none=True)
-        loss.backward()
-        synopt.step()
-        x_syn, y_syn = syndata.value()
-        pool_m.train_steps(x_syn, y_syn, steps=1)
+        # --------------------------------------
+        # Train
+        # --------------------------------------
+        for it in range(step_offset + 1, num_train_steps + 1):
+            ''' Train synthetic data '''
+            x_target, y_target = next(trainloader)
+            x_target = x_target.to(config.device)
+            y_target = y_target.to(config.device)
+            x_syn, y_syn = syndata()
 
-        synsch.step()
-        loss_sum += loss.item() * x_target.shape[0]
-        ln_loss_sum += ln_loss.item() * x_target.shape[0]
-        lb_loss_sum += lb_loss.item() * x_target.shape[0]
-        count += x_target.shape[0]
+            idx = np.random.randint(low=0, high=num_nn_state)
+            pool_m = pools[idx]
 
-        if it % 300 == 0:
+            y_pred = pool_m.nfr(x_syn, y_syn, x_target, use_flip=use_flip)
+            ln_loss = criterion(y_pred, y_target).sum(dim=-1).mean(0)
+            lb_loss = lb_margin_th(y_syn).mean()
+            loss = ln_loss + lb_loss
+
+            synopt.zero_grad(set_to_none=True)
+            loss.backward()
+            synopt.step()
             x_syn, y_syn = syndata.value()
-            x_norm = torch.mean(torch.linalg.norm(x_syn.view(x_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
-            y_norm = torch.mean(torch.linalg.norm(y_syn.view(y_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
-            summary = {'train/loss': loss_sum / count,
-                       'train/ln_loss': ln_loss_sum / count,
-                       'train/lb_loss': lb_loss_sum / count,
-                       'monitor/steps_per_second': count / 1024 / (time.time() - last_t),
-                       'monitor/learning_rate': synsch.get_last_lr()[0],
-                       'monitor/x_norm': x_norm,
-                       'monitor/y_norm': y_norm}
-            writer.write_scalars(it, summary)
+            pool_m.train_steps(x_syn, y_syn, steps=1)
 
-            last_t = time.time()
-            loss_sum, ln_loss_sum, lb_loss_sum, count = 0.0, 0.0, 0.0, 0
+            synsch.step()
+            loss_sum += loss.item() * x_target.shape[0]
+            ln_loss_sum += ln_loss.item() * x_target.shape[0]
+            lb_loss_sum += lb_loss.item() * x_target.shape[0]
+            count += x_target.shape[0]
 
-        ''' Evaluate synthetic data '''
-        if it in eval_it_pool or it % steps_per_eval == 0:
-            for model_eval in model_eval_pool:
-                print(
-                    '----------\nEvaluation\nmodel_train = {}, model_eval = {}, iteration = {}'.format(arch, model_eval,
-                                                                                                       it))
-                accs = []
-                for it_eval in range(3):
-                    net_eval = get_network(model_eval, channel, num_classes, im_size, width=width, depth=depth,
-                                           norm=eval_normalization).to(
-                        config.device)  # get a random model
-                    x_syn, y_syn = syndata.value()
-                    x_syn_eval, y_syn_eval = copy.deepcopy(x_syn), copy.deepcopy(y_syn)
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, x_syn_eval, y_syn_eval,
-                                                             testloader, args)
-                    accs.append(acc_test)
-                summary = {'eval/acc_mean': np.mean(accs), 'eval/acc_std': np.std(accs)}
+            if it % 300 == 0:
+                x_syn, y_syn = syndata.value()
+                x_norm = torch.mean(torch.linalg.norm(x_syn.view(x_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
+                y_norm = torch.mean(torch.linalg.norm(y_syn.view(y_syn.shape[0], -1), ord=2, dim=-1)).cpu().numpy()
+                summary = {'train/loss': loss_sum / count,
+                           'train/ln_loss': ln_loss_sum / count,
+                           'train/lb_loss': lb_loss_sum / count,
+                           'monitor/steps_per_second': count / 1024 / (time.time() - last_t),
+                           'monitor/learning_rate': synsch.get_last_lr()[0],
+                           'monitor/x_norm': x_norm,
+                           'monitor/y_norm': y_norm}
                 writer.write_scalars(it, summary)
 
-                if float(np.mean(accs)) > best_val_acc:
-                    ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
-                    best_val_acc = float(np.mean(accs))
-                    torch.save(dict(step_offset=it, best_val_acc=best_val_acc, syndata_state_dict=syndata.state_dict(),
-                                    synopt_state_dict=synopt.state_dict(), synsch_state_dict=synsch.state_dict()),
-                               ckpt_path)
-                    logging.info('{} Save checkpoint to {}, best acc {}!'.format(get_time(), ckpt_path, best_val_acc))
+                last_t = time.time()
+                loss_sum, ln_loss_sum, lb_loss_sum, count = 0.0, 0.0, 0.0, 0
 
-            ''' visualize and save '''
-            x_syn, y_syn = syndata.value()
-            x_proto, y_proto = copy.deepcopy(x_syn.cpu()), copy.deepcopy(y_syn.cpu().numpy())
-            if image_saver:
-                #print(type(x_proto))
-                x_proto = zca.inverse_transform(x_proto).numpy()
-                #for ch in range(channel):
-                    #x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
-                #x_proto[x_proto < 0] = 0.0
-                #x_proto[x_proto > 1] = 1.0
-                image_saver(x_proto, y_proto, step=it)
-            last_t = time.time()
+            ''' Evaluate synthetic data '''
+            if it in eval_it_pool or it % steps_per_eval == 0:
+                for model_eval in model_eval_pool:
+                    print(
+                        '----------\nEvaluation\nmodel_train = {}, model_eval = {}, iteration = {}'.format(arch, model_eval,
+                                                                                                           it))
+                    accs = []
+                    for it_eval in range(3):
+                        net_eval = get_network(model_eval, channel, num_classes, im_size, width=width, depth=depth,
+                                               norm=eval_normalization).to(
+                            config.device)  # get a random model
+                        x_syn, y_syn = syndata.value()
+                        x_syn_eval, y_syn_eval = copy.deepcopy(x_syn), copy.deepcopy(y_syn)
+                        _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, x_syn_eval, y_syn_eval,
+                                                                 testloader, args)
+                        accs.append(acc_test)
+                    summary = {'eval/acc_mean': np.mean(accs), 'eval/acc_std': np.std(accs)}
+                    writer.write_scalars(it, summary)
+                    accs_all_exps[arch].extend(accs)
 
-        if it % steps_per_save == 0:
-            ckpt_path = os.path.join(ckpt_dir, 'ckpt.pt')
-            torch.save(dict(step_offset=it, best_val_acc=best_val_acc, syndata_state_dict=syndata.state_dict(),
-                            synopt_state_dict=synopt.state_dict(), synsch_state_dict=synsch.state_dict()),
-                       ckpt_path)
-            logging.info('Save checkpoint to {}!'.format(ckpt_path))
+                    if float(np.mean(accs)) > best_val_acc:
+                        ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
+                        best_val_acc = float(np.mean(accs))
+                        torch.save(dict(step_offset=it, best_val_acc=best_val_acc, syndata_state_dict=syndata.state_dict(),
+                                        synopt_state_dict=synopt.state_dict(), synsch_state_dict=synsch.state_dict()),
+                                   ckpt_path)
+                        logging.info('{} Save checkpoint to {}, best acc {}!'.format(get_time(), ckpt_path, best_val_acc))
+
+                ''' visualize and save '''
+                x_syn, y_syn = syndata.value()
+                x_proto, y_proto = copy.deepcopy(x_syn.cpu()), copy.deepcopy(y_syn.cpu().numpy())
+                if image_saver:
+                    #print(type(x_proto))
+                    x_proto = zca.inverse_transform(x_proto).numpy()
+                    #for ch in range(channel):
+                        #x_proto[:, ch] = x_proto[:, ch] * std[ch] + mean[ch]
+                    #x_proto[x_proto < 0] = 0.0
+                    #x_proto[x_proto > 1] = 1.0
+                    image_saver(x_proto, y_proto, step=it)
+                last_t = time.time()
+
+            if it % steps_per_save == 0:
+                ckpt_path = os.path.join(ckpt_dir, 'ckpt.pt')
+                torch.save(dict(step_offset=it, best_val_acc=best_val_acc, syndata_state_dict=syndata.state_dict(),
+                                synopt_state_dict=synopt.state_dict(), synsch_state_dict=synsch.state_dict()),
+                           ckpt_path)
+                logging.info('Save checkpoint to {}!'.format(ckpt_path))
 
 
 if __name__ == '__main__':

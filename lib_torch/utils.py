@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import torchattacks
 
 from torchvision import datasets, transforms
 from scipy.ndimage.interpolation import rotate as scipyrotate
@@ -330,7 +331,7 @@ def get_loops(ipc):
     return outer_loop, inner_loop
 
 
-def epoch(mode, dataloader, net, optimizer, criterion, args, aug):
+def epoch(mode, dataloader, net, optimizer, criterion, args, aug, atk_args=None):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(args.device)
     criterion = criterion.to(args.device)
@@ -340,15 +341,27 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug):
     else:
         net.eval()
 
+    attack = None
+    if mode == 'test' and atk_args and atk_args["attack_eval"]:
+        if atk_args["method"].lower() == "pgd":
+            attack = torchattacks.PGD(net, eps=atk_args["eps"], alpha=atk_args["alpha"], steps=atk_args["steps"])
+        else:
+            raise ValueError
     for i_batch, datum in enumerate(dataloader):
         img = datum[0].float().to(args.device)
+        lab = datum[1].to(args.device)
         if aug:
             if args.dsa:
                 img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
             else:
                 img = augment(img, args.dc_aug_param, device=args.device)
+
+        if attack:
+            img = attack(img, lab)
+            img = img.contiguous()
+
         # lab = datum[1].long().to(args.device)
-        lab = datum[1].to(args.device)
+
         n_b = lab.shape[0]
         output = net(img)
         loss = criterion(output, lab)
@@ -370,7 +383,7 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug):
     return loss_avg, acc_avg
 
 
-def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args):
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, atk_args):
     net = net.to(args.device)
     images_train = images_train.to(args.device)
     labels_train = labels_train.to(args.device)
@@ -392,10 +405,10 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args):
         loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug=True)
         scheduler.step()
         # optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
-        if ep % (Epoch // 10) == 0:
-            print('Train epoch {}, acc = {}, loss = {}!'.format(ep, acc_train, loss_train))
+        #if ep % (Epoch // 5) == 0:
+            #print('Train epoch {}, acc = {}, loss = {}!'.format(ep, acc_train, loss_train))
     time_train = time.time() - start
-    loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, args, aug=False)
+    loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, args, aug=False, atk_args=atk_args)
     print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (
         get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
 
